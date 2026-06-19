@@ -94,7 +94,7 @@ class Config:
     dir_spreadsheet: str = "ID_SPREADSHEET"
 
     # Control de trafico hacia la API.
-    api_pause_seconds: float = 0.3
+    api_pause_seconds: float = 2.0
     max_retries: int = 5
     backoff_base_seconds: float = 5.0
 
@@ -473,9 +473,18 @@ class ReassignmentHandler:
                 f"abrir la hoja de {advisor.name}",
             )
             try:
-                worksheet = spreadsheet.worksheet(self._config.asesor_tab)
-            except WorksheetNotFound:
-                worksheet = spreadsheet.get_worksheet(0)
+                worksheet = self._sheets.with_retries(
+                    lambda: spreadsheet.worksheet(self._config.asesor_tab),
+                    f"abrir la pestania de {advisor.name}",
+                )
+            except ExternalServiceError as exc:
+                if isinstance(exc.__cause__, WorksheetNotFound):
+                    worksheet = self._sheets.with_retries(
+                        lambda: spreadsheet.get_worksheet(0),
+                        f"abrir la primera pestania de {advisor.name}",
+                    )
+                else:
+                    raise
             return self._sheets.with_retries(
                 worksheet.get_all_values, f"leer la hoja de {advisor.name}"
             )
