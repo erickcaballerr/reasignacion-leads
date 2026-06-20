@@ -4,36 +4,35 @@ Handler de reasignacion de leads para RE/MAX Terra.
 Cuando Beefast reasigna un lead a otro asesor, actualiza en la hoja MADRE
 la columna ASESOR y aumenta en uno el contador de reasignaciones, pero no
 mueve el lead entre las hojas individuales de cada asesor. Este proceso
-cierra esa brecha:
+cierra esa brecha de forma idempotente y a prueba de fallos.
 
-    1. Detecta en la hoja MADRE las filas cuya cantidad de reasignaciones
-       supera el contador de reasignaciones ya procesadas (AA > AB).
-    2. Para cada una, determina el asesor destino y el identificador del
-       lead (ID BEEFAST).
-    3. Localiza el lead en la hoja del asesor que lo posee actualmente.
-    4. Lo agrega a la hoja del asesor destino, verifica la insercion y solo
-       entonces lo elimina del asesor de origen.
-    5. Marca la reasignacion como procesada (AB := AA) en la hoja MADRE.
-    6. Registra el resultado de cada operacion en una hoja de auditoria.
+Flujo:
+    1. Toma un candado de ejecucion para impedir corridas solapadas.
+    2. Lee el directorio de asesores (nombre -> id de su libro).
+    3. Detecta en MADRE las filas cuyo contador de reasignaciones supera al
+       contador de reasignaciones ya procesadas (AA > AB).
+    4. Construye en memoria un indice {ID BEEFAST -> ubicacion} leyendo cada
+       libro de asesor una sola vez (lectura O(asesores), no O(pendientes x
+       asesores)).
+    5. Para cada pendiente: agrega la fila al asesor destino, verifica la
+       insercion con reintentos, elimina del asesor origen y marca la
+       reasignacion como procesada (AB := AA) en MADRE.
+    6. Registra cada operacion en la hoja de auditoria y libera el candado.
 
-Diseno defensivo:
-    - Identificadores no numericos o en cero se ignoran.
-    - Identificadores duplicados en la hoja MADRE se registran y se omiten.
-    - El contador procesado se normaliza (valores vacios equivalen a cero).
-    - El proceso escanea la hoja completa; no depende de disparadores por
-      edicion, dado que Beefast inserta filas en lugar de editarlas.
-    - Si el asesor destino no existe en el directorio, o el lead aun no
-      esta en ninguna hoja, no se marca como procesado y se reintenta en la
-      siguiente ejecucion.
-    - Un candado de ejecucion evita corridas solapadas.
-    - Las llamadas a la API reintentan ante limites de tasa.
-    - El orden agregar-verificar-eliminar garantiza que un lead nunca se
-      pierda: en el peor caso queda duplicado, jamas ausente.
+Garantias de diseno:
+    - Idempotencia: ejecutar repetidamente converge al mismo estado.
+    - No perdida: el orden agregar -> verificar -> eliminar asegura que un
+      lead nunca desaparezca; el peor caso es un duplicado transitorio que
+      una corrida posterior reconcilia.
+    - Resiliencia: toda llamada de red reintenta ante limites de tasa (429)
+      y errores transitorios (5xx) con espera incremental.
+    - Robustez de datos: identificadores no numericos o en cero se ignoran;
+      duplicados en MADRE se registran y omiten; contadores ausentes valen
+      cero; filas mas cortas de lo esperado se normalizan.
+    - Aislamiento de fallos: un asesor inaccesible o un lead irresoluble no
+      detiene el lote; se registra y se reintenta en la siguiente corrida.
 
-Para acelerar el proceso, las hojas de los asesores se leen una sola vez al
-inicio y se construye un indice en memoria; el cruce posterior es inmediato.
-
-Credenciales (variables de entorno):
+Credenciales (variable de entorno):
     GOOGLE_CREDENTIALS  Contenido JSON de la cuenta de servicio de Google.
 
 Uso:
@@ -45,16 +44,19 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import time
+import unicodedata
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, Optional, TypeVar
+from typing import Callable, Iterator, Optional, Sequence, TypeVar
 
 try:
     import gspread
     from google.oauth2.service_account import Credentials
-    from gspread.exceptions import APIError, WorksheetNotFound
+    from gspread.exceptions import APIError, GSpreadException, WorksheetNotFound
 except ImportError as exc:  # pragma: no cover
     sys.stderr.write(
         "Faltan dependencias requeridas. Instale con:\n"
@@ -64,13 +66,13 @@ except ImportError as exc:  # pragma: no cover
     raise SystemExit(1) from exc
 
 
-# --------------------------------------------------------------------------- #
-# Configuracion
-# --------------------------------------------------------------------------- #
+# =========================================================================== #
+# Configuracion inmutable
+# =========================================================================== #
 
 @dataclass(frozen=True)
 class Config:
-    """Parametros de ejecucion del handler de reasignacion."""
+    """Parametros de ejecucion. Inmutable para evitar mutaciones accidentales."""
 
     google_credentials: str
 
@@ -89,22 +91,26 @@ class Config:
     col_procesado: int = 27
     total_cols: int = 28
 
-    # Columnas del directorio.
+    # Encabezados del directorio.
     dir_nombre: str = "NOMBRE_ASESOR"
     dir_spreadsheet: str = "ID_SPREADSHEET"
 
-    # Control de trafico hacia la API.
-    api_pause_seconds: float = 2.0
-    max_retries: int = 5
-    backoff_base_seconds: float = 5.0
+    # Control de trafico y resiliencia de red.
+    api_pause_seconds: float = 1.2
+    max_retries: int = 6
+    backoff_base_seconds: float = 4.0
+    backoff_cap_seconds: float = 60.0
 
-    # Vigencia del candado de ejecucion, en minutos.
+    # Latencia de propagacion de Google tras una escritura, antes de releer.
+    write_propagation_seconds: float = 4.0
+    verify_attempts: int = 4
+    verify_interval_seconds: float = 3.0
+
+    # Vigencia del candado de ejecucion.
     lock_ttl_minutes: float = 10.0
 
     @classmethod
     def from_environment(cls) -> "Config":
-        import os
-
         google_creds = os.environ.get("GOOGLE_CREDENTIALS", "").strip()
         if not google_creds:
             raise ConfigurationError(
@@ -113,23 +119,26 @@ class Config:
         return cls(google_credentials=google_creds)
 
 
-NULOS = frozenset({"", "NAN", "NONE", "0"})
-ESTATUS_LOG_HEADER = [
+# Conjuntos de tokens que representan ausencia de valor.
+_NULL_ID_TOKENS = frozenset({"", "NAN", "NONE", "NULL", "0"})
+_NULL_INT_TOKENS = frozenset({"", "NAN", "NONE", "NULL"})
+
+_LOG_HEADER = (
     "FECHA",
     "ID BEEFAST",
     "ACCION",
     "ASESOR ANTERIOR",
     "ASESOR NUEVO",
     "DETALLE",
-]
+)
 
 
-# --------------------------------------------------------------------------- #
-# Excepciones
-# --------------------------------------------------------------------------- #
+# =========================================================================== #
+# Jerarquia de excepciones
+# =========================================================================== #
 
 class ReassignmentError(Exception):
-    """Error base del handler de reasignacion."""
+    """Error base del handler."""
 
 
 class ConfigurationError(ReassignmentError):
@@ -137,16 +146,16 @@ class ConfigurationError(ReassignmentError):
 
 
 class ExternalServiceError(ReassignmentError):
-    """Fallo no recuperable contra un servicio externo."""
+    """Fallo no recuperable contra un servicio externo tras agotar reintentos."""
 
 
 class LockActiveError(ReassignmentError):
-    """Otra ejecucion mantiene el candado activo."""
+    """Otra ejecucion mantiene el candado vigente."""
 
 
-# --------------------------------------------------------------------------- #
-# Utilidades
-# --------------------------------------------------------------------------- #
+# =========================================================================== #
+# Logging
+# =========================================================================== #
 
 logger = logging.getLogger("reasignacion")
 
@@ -168,25 +177,34 @@ def configure_logging() -> None:
     root.propagate = False
 
 
-def strip_accents(value: str) -> str:
-    import unicodedata
+# =========================================================================== #
+# Funciones puras de normalizacion
+# =========================================================================== #
 
-    text = str(value).strip().lower()
-    return unicodedata.normalize("NFD", text).encode("ascii", "ignore").decode("utf-8")
+def strip_accents(value: object) -> str:
+    """Normaliza a minusculas, sin acentos y con espacios colapsados."""
+    text = " ".join(str(value).strip().split()).lower()
+    decomposed = unicodedata.normalize("NFD", text)
+    return decomposed.encode("ascii", "ignore").decode("utf-8")
 
 
 def is_valid_id(value: object) -> bool:
-    """Un identificador es valido si es numerico y mayor que cero."""
+    """Un identificador es valido si es estrictamente numerico y mayor que cero."""
     text = str(value).strip()
-    if text.upper() in NULOS:
+    if text.upper() in _NULL_ID_TOKENS:
         return False
     return text.isdigit() and int(text) > 0
 
 
+def normalize_id(value: object) -> str:
+    """Forma canonica de un identificador para comparaciones e indexado."""
+    return str(value).strip()
+
+
 def to_int(value: object) -> int:
-    """Convierte a entero de forma tolerante; vacio o invalido equivale a 0."""
+    """Convierte a entero de forma tolerante; ausencia equivale a cero."""
     text = str(value).strip()
-    if text.upper() in {"", "NAN", "NONE"}:
+    if text.upper() in _NULL_INT_TOKENS:
         return 0
     try:
         return int(float(text))
@@ -194,18 +212,33 @@ def to_int(value: object) -> int:
         return 0
 
 
+def pad_row(row: Sequence[str], width: int) -> list[str]:
+    """Garantiza que una fila tenga exactamente 'width' columnas."""
+    values = list(row[:width])
+    if len(values) < width:
+        values.extend([""] * (width - len(values)))
+    return values
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-# --------------------------------------------------------------------------- #
-# Cliente de Google Sheets con reintentos
-# --------------------------------------------------------------------------- #
+# =========================================================================== #
+# Cliente de Google Sheets con reintentos y resolucion segura de pestañas
+# =========================================================================== #
 
 class SheetsClient:
-    """Envoltura sobre gspread con reintentos ante limites de tasa."""
+    """Acceso a Google Sheets con reintentos uniformes.
 
-    _SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+    Centraliza dos responsabilidades que antes estaban dispersas y eran
+    fuente de errores: el reintento ante fallos transitorios y la resolucion
+    de pestañas (que distingue 'no existe' de 'fallo de red' sin depender de
+    inspeccionar causas anidadas).
+    """
+
+    _SCOPES = ("https://www.googleapis.com/auth/spreadsheets",)
+    _RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
     def __init__(self, config: Config) -> None:
         self._config = config
@@ -219,45 +252,119 @@ class SheetsClient:
                 "GOOGLE_CREDENTIALS no contiene un JSON valido."
             ) from exc
         try:
-            creds = Credentials.from_service_account_info(info, scopes=self._SCOPES)
+            creds = Credentials.from_service_account_info(
+                info, scopes=list(self._SCOPES)
+            )
             return gspread.authorize(creds)
         except Exception as exc:  # noqa: BLE001
             raise ExternalServiceError(
                 f"No fue posible autenticar con Google: {exc}"
             ) from exc
 
-    def with_retries(self, operation: Callable[[], T], description: str) -> T:
+    def call(self, operation: Callable[[], T], description: str) -> T:
+        """Ejecuta una operacion de red reintentando fallos transitorios.
+
+        Reintenta ante codigos 429 y 5xx con espera exponencial acotada.
+        Cualquier otro APIError o error de gspread se considera definitivo y
+        se reempaqueta como ExternalServiceError, preservando la causa.
+        """
         last_exc: Optional[Exception] = None
         for attempt in range(1, self._config.max_retries + 1):
             try:
                 return operation()
             except APIError as exc:
-                status = getattr(exc.response, "status_code", None)
                 last_exc = exc
-                if status == 429 and attempt < self._config.max_retries:
-                    wait = self._config.backoff_base_seconds * attempt
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status in self._RETRYABLE_STATUS and attempt < self._config.max_retries:
+                    wait = min(
+                        self._config.backoff_base_seconds * (2 ** (attempt - 1)),
+                        self._config.backoff_cap_seconds,
+                    )
                     logger.warning(
-                        "Limite de tasa de Google al %s. "
-                        "Reintentando en %.0fs (intento %d/%d).",
-                        description, wait, attempt, self._config.max_retries,
+                        "Error transitorio %s al %s. Reintento %d/%d en %.0fs.",
+                        status, description, attempt, self._config.max_retries, wait,
                     )
                     time.sleep(wait)
                     continue
                 raise ExternalServiceError(
                     f"Error de la API de Google al {description}: {exc}"
                 ) from exc
+            except GSpreadException as exc:
+                # Errores de gspread que no son APIError (p. ej. parsing).
+                raise ExternalServiceError(
+                    f"Error de gspread al {description}: {exc}"
+                ) from exc
         raise ExternalServiceError(
             f"Se agotaron los reintentos al {description}."
         ) from last_exc
 
-    @property
-    def client(self) -> gspread.Client:
-        return self._client
+    def open_spreadsheet(self, spreadsheet_id: str) -> gspread.Spreadsheet:
+        return self.call(
+            lambda: self._client.open_by_key(spreadsheet_id),
+            f"abrir el libro {spreadsheet_id}",
+        )
+
+    def get_worksheet(
+        self, spreadsheet: gspread.Spreadsheet, title: str
+    ) -> Optional[gspread.Worksheet]:
+        """Devuelve la pestaña por titulo, o None si no existe.
+
+        Distingue limpiamente 'no existe' (None) de 'fallo de red' (excepcion)
+        sin que el llamador tenga que inspeccionar causas anidadas.
+        """
+        try:
+            return self.call(
+                lambda: spreadsheet.worksheet(title),
+                f"abrir la pestania '{title}'",
+            )
+        except ExternalServiceError as exc:
+            if isinstance(exc.__cause__, WorksheetNotFound):
+                return None
+            raise
+
+    def get_or_create_worksheet(
+        self,
+        spreadsheet: gspread.Spreadsheet,
+        title: str,
+        rows: int,
+        cols: int,
+        header: Optional[Sequence[str]] = None,
+    ) -> gspread.Worksheet:
+        """Obtiene la pestaña o la crea (con encabezado opcional) si falta."""
+        worksheet = self.get_worksheet(spreadsheet, title)
+        if worksheet is not None:
+            return worksheet
+        worksheet = self.call(
+            lambda: spreadsheet.add_worksheet(title=title, rows=rows, cols=cols),
+            f"crear la pestania '{title}'",
+        )
+        if header is not None:
+            self.call(
+                lambda: worksheet.update([list(header)], "A1"),
+                f"inicializar la pestania '{title}'",
+            )
+        return worksheet
+
+    def first_worksheet(self, spreadsheet: gspread.Spreadsheet) -> gspread.Worksheet:
+        return self.call(
+            lambda: spreadsheet.get_worksheet(0),
+            "abrir la primera pestania",
+        )
+
+    def read_values(
+        self, worksheet: gspread.Worksheet, description: str
+    ) -> list[list[str]]:
+        return self.call(worksheet.get_all_values, description)
+
+    def read_records(
+        self, worksheet: gspread.Worksheet, description: str
+    ) -> list[dict[str, object]]:
+        return self.call(worksheet.get_all_records, description)
 
 
-# --------------------------------------------------------------------------- #
-# Modelo de dominio
-# --------------------------------------------------------------------------- #
+# =========================================================================== #
+# Modelo de dominio (estructuras inmutables)
+# =========================================================================== #
 
 @dataclass(frozen=True)
 class Advisor:
@@ -267,28 +374,39 @@ class Advisor:
     spreadsheet_id: str
 
     @property
-    def normalized_name(self) -> str:
+    def key(self) -> str:
         return strip_accents(self.name)
 
 
 @dataclass(frozen=True)
 class LeadLocation:
-    """Ubicacion de un lead dentro de la hoja de un asesor."""
+    """Ubicacion de un lead dentro del libro de un asesor."""
 
     advisor: Advisor
     row_number: int
-    row_values: list[str]
 
 
 @dataclass(frozen=True)
 class PendingReassignment:
-    """Reasignacion detectada en la hoja MADRE, pendiente de aplicar."""
+    """Reasignacion detectada en MADRE, pendiente de aplicar."""
 
     madre_row: int
     lead_id: str
-    target_advisor_name: str
+    target_key: str
+    target_name_raw: str
     reassignment_count: int
-    row_values: list[str]
+    row_values: tuple[str, ...]
+
+
+class Action:
+    """Catalogo de acciones registrables en la auditoria."""
+
+    MOVED = "MOVIDO"
+    ALREADY_OK = "YA_CORRECTO"
+    PENDING = "PENDIENTE"
+    ERROR = "ERROR"
+    SKIPPED = "OMITIDO"
+    SIMULATED = "SIMULACION"
 
 
 @dataclass
@@ -315,6 +433,7 @@ class RunStats:
     """Contadores del resultado de una corrida."""
 
     moved: int = 0
+    already_ok: int = 0
     pending: int = 0
     errors: int = 0
     skipped: int = 0
@@ -322,481 +441,481 @@ class RunStats:
     def summary_lines(self, dry_run: bool) -> list[str]:
         title = "RESUMEN (SIMULACION)" if dry_run else "RESUMEN"
         return [
-            "-" * 56,
+            "-" * 58,
             f"  {title}",
-            "-" * 56,
-            f"  Movidos      : {self.moved}",
-            f"  Pendientes   : {self.pending} (se reintentaran)",
-            f"  Errores      : {self.errors} (se reintentaran)",
-            f"  Omitidos     : {self.skipped}",
-            "-" * 56,
+            "-" * 58,
+            f"  Movidos        : {self.moved}",
+            f"  Ya correctos   : {self.already_ok}",
+            f"  Pendientes     : {self.pending} (se reintentaran)",
+            f"  Errores        : {self.errors} (se reintentaran)",
+            f"  Omitidos       : {self.skipped}",
+            "-" * 58,
         ]
 
 
-# --------------------------------------------------------------------------- #
-# Indice de leads en hojas de asesores
-# --------------------------------------------------------------------------- #
+# =========================================================================== #
+# Indice en memoria de leads por asesor
+# =========================================================================== #
 
 class LeadIndex:
-    """Indice en memoria de la ubicacion de cada lead por asesor.
+    """Indice {ID BEEFAST -> ubicacion} construido de una sola lectura.
 
-    Se construye leyendo cada hoja de asesor una sola vez. Asocia cada
-    ID BEEFAST con su ubicacion, evitando busquedas repetidas sobre las 26
-    hojas para cada reasignacion.
+    Evita el patron O(pendientes x asesores): en lugar de buscar cada lead en
+    los 26 libros, se leen los 26 libros una vez y el cruce posterior es O(1).
     """
 
     def __init__(self) -> None:
         self._by_id: dict[str, LeadLocation] = {}
 
-    def register(self, advisor: Advisor, rows: list[list[str]], id_col: int) -> None:
+    def register(
+        self, advisor: Advisor, rows: Sequence[Sequence[str]], id_col: int
+    ) -> None:
         for offset, row in enumerate(rows[1:], start=2):
             if len(row) <= id_col:
                 continue
-            lead_id = str(row[id_col]).strip()
+            lead_id = normalize_id(row[id_col])
             if not is_valid_id(lead_id):
                 continue
-            # La primera aparicion gana; las duplicadas se ignoran a este
-            # nivel (los duplicados en MADRE se filtran por separado).
+            # La primera aparicion prevalece; conflictos internos de una hoja
+            # se ignoran a este nivel (los duplicados en MADRE se filtran
+            # aparte). setdefault evita sobrescribir.
             self._by_id.setdefault(
-                lead_id, LeadLocation(advisor=advisor, row_number=offset, row_values=row)
+                lead_id, LeadLocation(advisor=advisor, row_number=offset)
             )
 
     def locate(self, lead_id: str) -> Optional[LeadLocation]:
-        return self._by_id.get(str(lead_id).strip())
+        return self._by_id.get(normalize_id(lead_id))
 
 
-# --------------------------------------------------------------------------- #
-# Logica de reasignacion
-# --------------------------------------------------------------------------- #
+# =========================================================================== #
+# Repositorio de la hoja MADRE
+# =========================================================================== #
 
-class ReassignmentHandler:
-    """Orquesta la deteccion y aplicacion de reasignaciones de leads."""
+class MadreRepository:
+    """Encapsula toda lectura/escritura sobre el libro MADRE."""
 
-    def __init__(self, config: Config, sheets: SheetsClient, dry_run: bool) -> None:
+    def __init__(self, config: Config, sheets: SheetsClient) -> None:
         self._config = config
         self._sheets = sheets
-        self._dry_run = dry_run
-        self._madre = sheets.with_retries(
-            lambda: sheets.client.open_by_key(config.madre_sheet_id),
-            "abrir el libro MADRE",
-        )
+        self._spreadsheet = sheets.open_spreadsheet(config.madre_sheet_id)
+        self._control_ws: Optional[gspread.Worksheet] = None
 
-    # -- Candado de ejecucion --------------------------------------------- #
+    # -- Pestaña principal ------------------------------------------------- #
 
-    def _acquire_lock(self) -> None:
-        try:
-            worksheet = self._sheets.with_retries(
-                lambda: self._madre.worksheet(self._config.lock_tab),
-                "leer el candado",
-            )
-            values = self._sheets.with_retries(
-                worksheet.get_all_values, "leer el candado"
-            )
-            if values and values[0]:
-                try:
-                    stamped = datetime.fromisoformat(values[0][0])
-                    age_min = (
-                        datetime.now(timezone.utc) - stamped
-                    ).total_seconds() / 60
-                    if age_min < self._config.lock_ttl_minutes:
-                        raise LockActiveError(
-                            f"Candado activo hace {age_min:.1f} min."
-                        )
-                except ValueError:
-                    pass  # marca ilegible: se sobrescribe
-        except ExternalServiceError as exc:
-            if isinstance(exc.__cause__, WorksheetNotFound):
-                worksheet = self._sheets.with_retries(
-                    lambda: self._madre.add_worksheet(
-                        title=self._config.lock_tab, rows=1, cols=1
-                    ),
-                    "crear el candado",
+    def _control_worksheet(self) -> gspread.Worksheet:
+        if self._control_ws is None:
+            ws = self._sheets.get_worksheet(self._spreadsheet, self._config.madre_tab)
+            if ws is None:
+                raise ReassignmentError(
+                    f"No existe la pestania '{self._config.madre_tab}' en MADRE."
                 )
-            else:
-                raise
+            self._control_ws = ws
+        return self._control_ws
 
-        self._sheets.with_retries(
-            lambda: worksheet.update([[utc_now_iso()]], "A1"),
-            "tomar el candado",
+    # -- Candado ----------------------------------------------------------- #
+
+    def acquire_lock(self) -> None:
+        """Toma el candado o aborta si hay uno vigente.
+
+        El candado es una pestaña con una marca temporal en A1. Si la marca
+        es reciente, otra ejecucion esta en curso. Marcas ilegibles o
+        vencidas se sobrescriben.
+        """
+        ws = self._sheets.get_worksheet(self._spreadsheet, self._config.lock_tab)
+        if ws is not None:
+            values = self._sheets.read_values(ws, "leer el candado")
+            stamp = values[0][0] if values and values[0] else ""
+            if self._lock_is_fresh(stamp):
+                raise LockActiveError("Hay una ejecucion en curso (candado vigente).")
+        else:
+            ws = self._sheets.get_or_create_worksheet(
+                self._spreadsheet, self._config.lock_tab, rows=1, cols=1
+            )
+        self._sheets.call(
+            lambda: ws.update([[utc_now_iso()]], "A1"), "tomar el candado"
         )
 
-    def _release_lock(self) -> None:
+    def _lock_is_fresh(self, stamp: str) -> bool:
+        if not stamp:
+            return False
         try:
-            worksheet = self._sheets.with_retries(
-                lambda: self._madre.worksheet(self._config.lock_tab),
-                "liberar el candado",
-            )
-            self._sheets.with_retries(
-                lambda: worksheet.update([[""]], "A1"), "liberar el candado"
-            )
-        except ReassignmentError:
-            logger.warning("No fue posible liberar el candado.")
+            stamped = datetime.fromisoformat(stamp)
+        except ValueError:
+            return False
+        if stamped.tzinfo is None:
+            stamped = stamped.replace(tzinfo=timezone.utc)
+        age_minutes = (datetime.now(timezone.utc) - stamped).total_seconds() / 60.0
+        return age_minutes < self._config.lock_ttl_minutes
 
-    # -- Carga de datos ---------------------------------------------------- #
+    def release_lock(self) -> None:
+        ws = self._sheets.get_worksheet(self._spreadsheet, self._config.lock_tab)
+        if ws is None:
+            return
+        try:
+            self._sheets.call(
+                lambda: ws.update([[""]], "A1"), "liberar el candado"
+            )
+        except ExternalServiceError:
+            logger.warning("No fue posible liberar el candado; vencera por TTL.")
 
-    def _load_directory(self) -> dict[str, Advisor]:
-        worksheet = self._sheets.with_retries(
-            lambda: self._madre.worksheet(self._config.directorio_tab),
-            "abrir el directorio",
-        )
-        records = self._sheets.with_retries(
-            worksheet.get_all_records, "leer el directorio"
-        )
+    # -- Directorio -------------------------------------------------------- #
+
+    def load_directory(self) -> dict[str, Advisor]:
+        ws = self._sheets.get_worksheet(self._spreadsheet, self._config.directorio_tab)
+        if ws is None:
+            raise ReassignmentError(
+                f"No existe la pestania '{self._config.directorio_tab}'."
+            )
+        records = self._sheets.read_records(ws, "leer el directorio")
         directory: dict[str, Advisor] = {}
         for record in records:
             name = str(record.get(self._config.dir_nombre, "")).strip()
             ss_id = str(record.get(self._config.dir_spreadsheet, "")).strip()
-            if name and ss_id:
-                advisor = Advisor(name=name, spreadsheet_id=ss_id)
-                directory[advisor.normalized_name] = advisor
+            if not name or not ss_id:
+                continue
+            advisor = Advisor(name=name, spreadsheet_id=ss_id)
+            # Si dos filas comparten nombre normalizado, la primera prevalece.
+            directory.setdefault(advisor.key, advisor)
         logger.info("Asesores en el directorio: %d", len(directory))
         return directory
 
-    def _build_lead_index(self, directory: dict[str, Advisor]) -> LeadIndex:
-        """Lee cada hoja de asesor una vez y construye el indice de leads."""
-        index = LeadIndex()
-        total = len(directory)
-        for position, advisor in enumerate(directory.values(), start=1):
-            logger.info(
-                "  Indexando %d/%d: %s", position, total, advisor.name
-            )
-            rows = self._read_advisor_rows(advisor)
-            if rows is not None:
-                index.register(advisor, rows, self._config.col_id)
-            time.sleep(self._config.api_pause_seconds)
-        return index
+    # -- Deteccion de pendientes ------------------------------------------ #
 
-    def _read_advisor_rows(self, advisor: Advisor) -> Optional[list[list[str]]]:
-        try:
-            spreadsheet = self._sheets.with_retries(
-                lambda: self._sheets.client.open_by_key(advisor.spreadsheet_id),
-                f"abrir la hoja de {advisor.name}",
-            )
-            try:
-                worksheet = self._sheets.with_retries(
-                    lambda: spreadsheet.worksheet(self._config.asesor_tab),
-                    f"abrir la pestania de {advisor.name}",
-                )
-            except ExternalServiceError as exc:
-                if isinstance(exc.__cause__, WorksheetNotFound):
-                    worksheet = self._sheets.with_retries(
-                        lambda: spreadsheet.get_worksheet(0),
-                        f"abrir la primera pestania de {advisor.name}",
-                    )
-                else:
-                    raise
-            return self._sheets.with_retries(
-                worksheet.get_all_values, f"leer la hoja de {advisor.name}"
-            )
-        except ReassignmentError as exc:
-            logger.warning("No se pudo leer la hoja de %s: %s", advisor.name, exc)
-            return None
+    def detect_pending(
+        self, directory: dict[str, Advisor]
+    ) -> tuple[list[PendingReassignment], LogBuffer]:
+        ws = self._control_worksheet()
+        values = self._sheets.read_values(ws, "leer la hoja MADRE")
+        logger.info("Filas en la hoja MADRE: %d", max(len(values) - 1, 0))
 
-    def _detect_pending(self) -> tuple[list[PendingReassignment], set[str], LogBuffer]:
-        """Detecta reasignaciones pendientes y duplicados en la hoja MADRE."""
-        worksheet = self._sheets.with_retries(
-            lambda: self._madre.worksheet(self._config.madre_tab),
-            "abrir la hoja MADRE",
-        )
-        values = self._sheets.with_retries(
-            worksheet.get_all_values, "leer la hoja MADRE"
-        )
-        logger.info("Filas en la hoja MADRE: %d", len(values) - 1)
-
-        duplicates = self._find_duplicate_ids(values)
+        duplicates = self._duplicate_ids(values)
         if duplicates:
             logger.warning(
                 "Identificadores duplicados en MADRE (se omitiran): %s",
                 sorted(duplicates)[:10],
             )
 
+        cfg = self._config
         pending: list[PendingReassignment] = []
         log = LogBuffer()
-        cfg = self._config
 
-        for offset, row in enumerate(values[1:], start=2):
-            normalized = list(row) + [""] * (cfg.total_cols - len(row))
-            lead_id = str(normalized[cfg.col_id]).strip()
-            advisor = str(normalized[cfg.col_asesor]).strip()
-            count = to_int(normalized[cfg.col_reasignaciones])
-            processed = to_int(normalized[cfg.col_procesado])
+        for offset, raw in enumerate(values[1:], start=2):
+            row = pad_row(raw, cfg.total_cols)
+            lead_id = normalize_id(row[cfg.col_id])
+            advisor_raw = str(row[cfg.col_asesor]).strip()
+            count = to_int(row[cfg.col_reasignaciones])
+            processed = to_int(row[cfg.col_procesado])
 
             if count <= processed:
                 continue
             if not is_valid_id(lead_id):
                 continue
             if lead_id in duplicates:
-                log.add(lead_id, "OMITIDO", "", advisor, "ID duplicado en MADRE")
+                log.add(lead_id, Action.SKIPPED, "", advisor_raw, "ID duplicado en MADRE")
+                continue
+            if not advisor_raw:
+                log.add(lead_id, Action.ERROR, "", "", "Asesor destino vacio en MADRE")
+                continue
+
+            target_key = strip_accents(advisor_raw)
+            if target_key not in directory:
+                log.add(
+                    lead_id, Action.ERROR, "", advisor_raw,
+                    "Asesor destino ausente del directorio",
+                )
                 continue
 
             pending.append(
                 PendingReassignment(
                     madre_row=offset,
                     lead_id=lead_id,
-                    target_advisor_name=advisor,
+                    target_key=target_key,
+                    target_name_raw=advisor_raw,
                     reassignment_count=count,
-                    row_values=normalized[: cfg.total_cols],
+                    row_values=tuple(row),
                 )
             )
 
-        logger.info("Reasignaciones pendientes: %d", len(pending))
-        return pending, duplicates, log
+        logger.info("Reasignaciones pendientes y validas: %d", len(pending))
+        return pending, log
 
-    def _find_duplicate_ids(self, values: list[list[str]]) -> set[str]:
+    def _duplicate_ids(self, values: Sequence[Sequence[str]]) -> frozenset[str]:
         counts: dict[str, int] = {}
+        col = self._config.col_id
         for row in values[1:]:
-            if len(row) > self._config.col_id:
-                lead_id = str(row[self._config.col_id]).strip()
+            if len(row) > col:
+                lead_id = normalize_id(row[col])
                 if is_valid_id(lead_id):
                     counts[lead_id] = counts.get(lead_id, 0) + 1
-        return {lead_id for lead_id, total in counts.items() if total > 1}
+        return frozenset(lead_id for lead_id, n in counts.items() if n > 1)
 
-    # -- Aplicacion -------------------------------------------------------- #
+    def mark_processed(self, item: PendingReassignment) -> None:
+        ws = self._control_worksheet()
+        self._sheets.call(
+            lambda: ws.update_cell(
+                item.madre_row, self._config.col_procesado + 1, item.reassignment_count
+            ),
+            f"marcar procesada la fila {item.madre_row}",
+        )
 
-    def _process_one(
+    # -- Auditoria --------------------------------------------------------- #
+
+    def append_log(self, log: LogBuffer) -> None:
+        if not log.entries:
+            return
+        try:
+            ws = self._sheets.get_or_create_worksheet(
+                self._spreadsheet,
+                self._config.log_tab,
+                rows=2000,
+                cols=len(_LOG_HEADER),
+                header=_LOG_HEADER,
+            )
+            self._sheets.call(
+                lambda: ws.append_rows(log.entries, value_input_option="RAW"),
+                "escribir la auditoria",
+            )
+        except ExternalServiceError as exc:
+            logger.warning("No fue posible escribir la auditoria: %s", exc)
+
+
+# =========================================================================== #
+# Repositorio de los libros de asesores
+# =========================================================================== #
+
+class AdvisorRepository:
+    """Encapsula lectura/escritura sobre los libros individuales."""
+
+    def __init__(self, config: Config, sheets: SheetsClient) -> None:
+        self._config = config
+        self._sheets = sheets
+
+    def _worksheet(self, advisor: Advisor) -> gspread.Worksheet:
+        spreadsheet = self._sheets.open_spreadsheet(advisor.spreadsheet_id)
+        ws = self._sheets.get_worksheet(spreadsheet, self._config.asesor_tab)
+        if ws is None:
+            ws = self._sheets.first_worksheet(spreadsheet)
+        return ws
+
+    def read_rows(self, advisor: Advisor) -> Optional[list[list[str]]]:
+        try:
+            ws = self._worksheet(advisor)
+            return self._sheets.read_values(ws, f"leer el libro de {advisor.name}")
+        except ExternalServiceError as exc:
+            logger.warning("No se pudo leer el libro de %s: %s", advisor.name, exc)
+            return None
+
+    def append_lead(self, advisor: Advisor, row_values: Sequence[str]) -> None:
+        ws = self._worksheet(advisor)
+        payload = pad_row(row_values, self._config.total_cols)
+        self._sheets.call(
+            lambda: ws.append_row(payload, value_input_option="RAW"),
+            f"agregar el lead a {advisor.name}",
+        )
+
+    def delete_row(self, advisor: Advisor, row_number: int) -> None:
+        ws = self._worksheet(advisor)
+        self._sheets.call(
+            lambda: ws.delete_rows(row_number),
+            f"eliminar la fila {row_number} de {advisor.name}",
+        )
+
+    def contains_lead(self, advisor: Advisor, lead_id: str) -> bool:
+        ws = self._worksheet(advisor)
+        values = self._sheets.read_values(ws, f"verificar en {advisor.name}")
+        target = normalize_id(lead_id)
+        col = self._config.col_id
+        for row in values[1:]:
+            if len(row) > col and normalize_id(row[col]) == target:
+                return True
+        return False
+
+    def verify_present(self, advisor: Advisor, lead_id: str) -> bool:
+        """Confirma la presencia de un lead reintentando ante la latencia de
+        propagacion de Google tras una escritura."""
+        for attempt in range(1, self._config.verify_attempts + 1):
+            if self.contains_lead(advisor, lead_id):
+                return True
+            if attempt < self._config.verify_attempts:
+                time.sleep(self._config.verify_interval_seconds)
+        return False
+
+
+# =========================================================================== #
+# Orquestador
+# =========================================================================== #
+
+class ReassignmentHandler:
+    """Coordina la deteccion y aplicacion de reasignaciones."""
+
+    def __init__(
+        self,
+        config: Config,
+        madre: MadreRepository,
+        advisors: AdvisorRepository,
+        dry_run: bool,
+    ) -> None:
+        self._config = config
+        self._madre = madre
+        self._advisors = advisors
+        self._dry_run = dry_run
+
+    @contextmanager
+    def _lock(self) -> Iterator[None]:
+        """Gestiona el candado de forma segura aun ante excepciones."""
+        acquired = False
+        if not self._dry_run:
+            self._madre.acquire_lock()
+            acquired = True
+        try:
+            yield
+        finally:
+            if acquired:
+                self._madre.release_lock()
+
+    def _build_index(self, directory: dict[str, Advisor]) -> LeadIndex:
+        index = LeadIndex()
+        total = len(directory)
+        for position, advisor in enumerate(directory.values(), start=1):
+            logger.info("  Indexando %d/%d: %s", position, total, advisor.name)
+            rows = self._advisors.read_rows(advisor)
+            if rows is not None:
+                index.register(advisor, rows, self._config.col_id)
+            time.sleep(self._config.api_pause_seconds)
+        return index
+
+    def _process(
         self,
         item: PendingReassignment,
         directory: dict[str, Advisor],
-        lead_index: LeadIndex,
-        madre_ws: gspread.Worksheet,
+        index: LeadIndex,
         log: LogBuffer,
         stats: RunStats,
     ) -> None:
-        target_key = strip_accents(item.target_advisor_name)
-        target = directory.get(target_key)
+        target = directory[item.target_key]
+        current = index.locate(item.lead_id)
 
-        if target is None:
-            logger.warning(
-                "Asesor destino '%s' no esta en el directorio. Se reintentara.",
-                item.target_advisor_name,
-            )
+        # Caso 1: ya esta en el asesor correcto -> solo marcar procesado.
+        if current is not None and current.advisor.key == item.target_key:
+            logger.info("Lead %s ya pertenece a %s.", item.lead_id, target.name)
+            if not self._dry_run:
+                self._madre.mark_processed(item)
             log.add(
-                item.lead_id, "ERROR", "", item.target_advisor_name,
-                "Asesor destino ausente del directorio",
-            )
-            stats.errors += 1
-            return
-
-        current = lead_index.locate(item.lead_id)
-
-        if current is not None and current.advisor.normalized_name == target_key:
-            logger.info(
-                "Lead %s ya pertenece a %s. Se marca como procesado.",
-                item.lead_id, target.name,
-            )
-            self._mark_processed(madre_ws, item)
-            log.add(
-                item.lead_id, "YA_CORRECTO", target.name, target.name,
+                item.lead_id, Action.ALREADY_OK, target.name, target.name,
                 "El lead ya estaba en el asesor destino",
             )
+            stats.already_ok += 1
             return
 
+        # Caso 2: el lead aun no existe en ninguna hoja -> reintentar luego.
         if current is None:
             logger.warning(
-                "Lead %s no se encontro en ninguna hoja. Se reintentara.",
+                "Lead %s no encontrado en ninguna hoja. Se reintentara.",
                 item.lead_id,
             )
             log.add(
-                item.lead_id, "PENDIENTE", "", item.target_advisor_name,
+                item.lead_id, Action.PENDING, "", item.target_name_raw,
                 "El lead aun no existe en ninguna hoja",
             )
             stats.pending += 1
             return
 
+        # Caso 3: simulacion.
         if self._dry_run:
             logger.info(
                 "Simulacion: lead %s se moveria de %s a %s.",
                 item.lead_id, current.advisor.name, target.name,
             )
             log.add(
-                item.lead_id, "SIMULACION", current.advisor.name, target.name,
+                item.lead_id, Action.SIMULATED, current.advisor.name, target.name,
                 "Sin cambios (simulacion)",
             )
             stats.moved += 1
             return
 
-        self._move_lead(item, current, target, madre_ws, log, stats)
+        # Caso 4: mover de verdad.
+        self._move(item, current, target, log, stats)
 
-    def _move_lead(
+    def _move(
         self,
         item: PendingReassignment,
         current: LeadLocation,
         target: Advisor,
-        madre_ws: gspread.Worksheet,
         log: LogBuffer,
         stats: RunStats,
     ) -> None:
-        """Mueve el lead garantizando que nunca se pierda.
+        """Mueve el lead con la garantia de no perdida.
 
-        Orden estricto: primero se agrega al destino, se verifica la
-        insercion, y solo entonces se elimina del origen. Ante cualquier
-        fallo, el lead permanece (a lo sumo duplicado, nunca ausente) y la
-        reasignacion no se marca como procesada para reintentarse despues.
+        Orden estricto e innegociable: agregar al destino, esperar la
+        propagacion, verificar, eliminar del origen y recien entonces marcar
+        procesado. Si algo falla, no se marca procesado y la fila permanece
+        elegible para la siguiente corrida; el lead jamas desaparece.
         """
+        origin = current.advisor
         try:
-            target_ws = self._open_advisor_worksheet(target)
+            self._advisors.append_lead(target, list(item.row_values))
+            time.sleep(self._config.write_propagation_seconds)
 
-            payload = list(item.row_values)[: self._config.total_cols]
-            self._sheets.with_retries(
-                lambda: target_ws.append_row(payload, value_input_option="RAW"),
-                f"agregar el lead a {target.name}",
-            )
-            # Google Sheets necesita unos segundos para propagar una
-            # escritura antes de que sea visible en lecturas posteriores.
-            time.sleep(5.0)
-
-            if not self._verify_present(target, item.lead_id):
+            if not self._advisors.verify_present(target, item.lead_id):
                 raise ExternalServiceError(
-                    "No se pudo verificar la insercion en el asesor destino."
+                    "No se verifico la insercion en el asesor destino."
                 )
 
-            origin_ws = self._open_advisor_worksheet(current.advisor)
-            self._sheets.with_retries(
-                lambda: origin_ws.delete_rows(current.row_number),
-                f"eliminar el lead de {current.advisor.name}",
-            )
-            time.sleep(self._config.api_pause_seconds)
-
-            self._mark_processed(madre_ws, item)
+            self._advisors.delete_row(origin, current.row_number)
+            self._madre.mark_processed(item)
 
             logger.info(
                 "Lead %s movido de %s a %s.",
-                item.lead_id, current.advisor.name, target.name,
+                item.lead_id, origin.name, target.name,
             )
-            log.add(
-                item.lead_id, "MOVIDO", current.advisor.name, target.name, "OK"
-            )
+            log.add(item.lead_id, Action.MOVED, origin.name, target.name, "OK")
             stats.moved += 1
 
-        except ReassignmentError as exc:
+        except ExternalServiceError as exc:
             logger.error("Error moviendo el lead %s: %s", item.lead_id, exc)
             log.add(
-                item.lead_id, "ERROR", current.advisor.name, target.name, str(exc)[:200]
+                item.lead_id, Action.ERROR, origin.name, target.name, str(exc)[:250]
             )
             stats.errors += 1
 
-    def _open_advisor_worksheet(self, advisor: Advisor) -> gspread.Worksheet:
-        spreadsheet = self._sheets.with_retries(
-            lambda: self._sheets.client.open_by_key(advisor.spreadsheet_id),
-            f"abrir la hoja de {advisor.name}",
-        )
-        try:
-            return spreadsheet.worksheet(self._config.asesor_tab)
-        except WorksheetNotFound:
-            return spreadsheet.get_worksheet(0)
-
-    def _verify_present(self, advisor: Advisor, lead_id: str) -> bool:
-        worksheet = self._open_advisor_worksheet(advisor)
-        values = self._sheets.with_retries(
-            worksheet.get_all_values, f"verificar el lead en {advisor.name}"
-        )
-        for row in values[1:]:
-            if len(row) > self._config.col_id and str(
-                row[self._config.col_id]
-            ).strip() == lead_id:
-                return True
-        return False
-
-    def _mark_processed(
-        self, madre_ws: gspread.Worksheet, item: PendingReassignment
-    ) -> None:
-        self._sheets.with_retries(
-            lambda: madre_ws.update_cell(
-                item.madre_row,
-                self._config.col_procesado + 1,
-                item.reassignment_count,
-            ),
-            "marcar la reasignacion como procesada",
-        )
-
-    def _write_log(self, log: LogBuffer) -> None:
-        if not log.entries:
-            return
-        try:
-            try:
-                worksheet = self._sheets.with_retries(
-                    lambda: self._madre.worksheet(self._config.log_tab),
-                    "abrir la hoja de log",
-                )
-            except ExternalServiceError as exc:
-                if isinstance(exc.__cause__, WorksheetNotFound):
-                    worksheet = self._sheets.with_retries(
-                        lambda: self._madre.add_worksheet(
-                            title=self._config.log_tab, rows=1000, cols=6
-                        ),
-                        "crear la hoja de log",
-                    )
-                    self._sheets.with_retries(
-                        lambda: worksheet.update([ESTATUS_LOG_HEADER], "A1"),
-                        "inicializar la hoja de log",
-                    )
-                else:
-                    raise
-            self._sheets.with_retries(
-                lambda: worksheet.append_rows(
-                    log.entries, value_input_option="RAW"
-                ),
-                "escribir el log",
-            )
-        except ReassignmentError as exc:
-            logger.warning("No fue posible escribir el log: %s", exc)
-
-    # -- Punto de entrada -------------------------------------------------- #
-
     def run(self) -> RunStats:
         stats = RunStats()
-
-        if not self._dry_run:
-            self._acquire_lock()
-
-        try:
-            directory = self._load_directory()
-            pending, _, log = self._detect_pending()
+        with self._lock():
+            directory = self._madre.load_directory()
+            pending, log = self._madre.detect_pending(directory)
 
             if not pending:
                 logger.info("No hay reasignaciones pendientes.")
-                if not self._dry_run:
-                    self._write_log(log)
+                self._madre.append_log(log)
                 return stats
 
-            lead_index = self._build_lead_index(directory)
-
-            madre_ws = self._sheets.with_retries(
-                lambda: self._madre.worksheet(self._config.madre_tab),
-                "abrir la hoja MADRE",
-            )
+            index = self._build_index(directory)
 
             for item in pending:
                 logger.info(
                     "Procesando lead %s -> %s",
-                    item.lead_id, item.target_advisor_name,
+                    item.lead_id, item.target_name_raw,
                 )
-                self._process_one(
-                    item, directory, lead_index, madre_ws, log, stats
-                )
+                self._process(item, directory, index, log, stats)
 
-            if not self._dry_run:
-                self._write_log(log)
-            else:
+            if self._dry_run:
                 logger.info(
-                    "Simulacion: se habrian registrado %d entradas de log.",
+                    "Simulacion: se habrian registrado %d entradas de auditoria.",
                     len(log.entries),
                 )
-
-        finally:
-            if not self._dry_run:
-                self._release_lock()
+            else:
+                self._madre.append_log(log)
 
         return stats
 
 
-# --------------------------------------------------------------------------- #
+# =========================================================================== #
 # Punto de entrada
-# --------------------------------------------------------------------------- #
+# =========================================================================== #
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: Optional[Sequence[str]] = None) -> int:
     configure_logging()
-    args = argv if argv is not None else sys.argv[1:]
+    args = list(argv) if argv is not None else sys.argv[1:]
     dry_run = "--dry-run" in args
 
     mode = "SIMULACION (sin escritura)" if dry_run else "EJECUCION REAL"
@@ -805,7 +924,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         config = Config.from_environment()
         sheets = SheetsClient(config)
-        handler = ReassignmentHandler(config, sheets, dry_run)
+        madre = MadreRepository(config, sheets)
+        advisors = AdvisorRepository(config, sheets)
+        handler = ReassignmentHandler(config, madre, advisors, dry_run)
         stats = handler.run()
     except LockActiveError as exc:
         logger.info("Ejecucion omitida: %s", exc)
@@ -822,7 +943,6 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     for line in stats.summary_lines(dry_run):
         logger.info(line)
-
     return 0
 
 
