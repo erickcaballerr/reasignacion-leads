@@ -641,7 +641,9 @@ class ReassignmentHandler:
                 lambda: target_ws.append_row(payload, value_input_option="RAW"),
                 f"agregar el lead a {target.name}",
             )
-            time.sleep(self._config.api_pause_seconds)
+            # Google Sheets necesita unos segundos para propagar una
+            # escritura antes de que sea visible en lecturas posteriores.
+            time.sleep(5.0)
 
             if not self._verify_present(target, item.lead_id):
                 raise ExternalServiceError(
